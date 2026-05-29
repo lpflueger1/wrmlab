@@ -211,16 +211,17 @@ def plot_acf_pacf(station, variable, acf_avg, pacf_avg, conf, segments, max_lag)
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. MODEL FITTING
 # ══════════════════════════════════════════════════════════════════════════════
-
 def select_order_from_acf_pacf(series, max_lag=24, max_order=6):
-    """
-    Suggest AR order p from PACF cutoff and MA order q from ACF cutoff.
-    Both are capped at max_order.
-    """
-    n    = len(series.dropna())
-    conf = 1.96 / np.sqrt(n)
-    acf_v  = acf(series.dropna(),  nlags=max_lag, fft=False, missing='drop')
-    pacf_v = pacf(series.dropna(), nlags=max_lag, method='ywm')
+    s = series.dropna()
+    n = len(s)
+    max_lag = min(max_lag, n // 2 - 1)  # sicherstellen dass nlags < n/2
+    if max_lag < 1:
+        return 0, 0
+
+    conf  = 1.96 / np.sqrt(n)
+    acf_v  = acf(s,  nlags=max_lag, fft=False, missing='drop')
+    pacf_v = pacf(s, nlags=max_lag, method='ywm')
+
     p = 0
     for lag in range(1, max_lag + 1):
         if abs(pacf_v[lag]) > conf: p = lag
@@ -229,67 +230,31 @@ def select_order_from_acf_pacf(series, max_lag=24, max_order=6):
     for lag in range(1, max_lag + 1):
         if abs(acf_v[lag]) > conf: q = lag
         else: break
+
     return min(p, max_order), min(q, max_order)
 
 
-def candidate_models(y, max_ar=6, max_ma=1):
-    y = np.asarray(y.dropna(), dtype=float)
-    results = []
-
-    for p in range(1, max_ar + 1):
-        m = ARIMA(y, order=(p, 0, 0)).fit()
-        results.append(('AR', p, 0, m.bic))
-
-    for p in range(1, max_ar + 1):
-        for q in range(1, max_ma + 1):
-            m = ARIMA(y, order=(p, 0, q)).fit()
-            results.append(('ARMA', p, q, m.bic))
-
-    return (pd.DataFrame(results, columns=['model', 'p', 'q', 'bic'])
-              .sort_values('bic'))
-
-
-def fit_best_models(z_series, max_ar=6, max_ma=3):
-    """
-    For each series in z_series, fit AR and ARMA models.
-    Model orders are selected based on PACF/ACF cutoffs (not BIC).
-    
-    - AR order p is determined from PACF (first non-significant lag).
-    - MA order q is determined from ACF (first non-significant lag).
-    
-    Returns fitted_models dict: {key_AR: model, key_ARMA: model, ...}
-    """
+def fit_best_models(z_series, max_ar=20, max_ma=3):
     fitted_models = {}
 
     for key, z in z_series.items():
-        variable, station = key.split('_', 1)
-        print(f'\n===== {station} {variable} =====')
-
-        # Determine AR and MA orders from PACF/ACF cutoffs
+        z = z.dropna().asfreq('MS')  # Frequenz nach dropna neu setzen
         p, q = select_order_from_acf_pacf(z, max_lag=24, max_order=max_ar)
-        print(f'  PACF/ACF-based orders: p={p}, q={q}')
 
-        # Fit AR(p) model
         try:
-            ar_model = ARIMA(z.dropna(), order=(p, 0, 0)).fit()
+            ar_model = ARIMA(z, order=(p, 0, 0)).fit()
             fitted_models[f'{key}_AR'] = ar_model
-            print(f'  ✓ AR({p})  converged – BIC={ar_model.bic:.1f}')
         except Exception as e:
-            print(f'  ✗ AR({p}) failed: {e}')
+            print(f'AR({p}) failed for {key}: {e}')
 
-        # Fit ARMA(p,q) model if q > 0
         if q > 0:
             try:
-                arma_model = ARIMA(z.dropna(), order=(p, 0, q)).fit()
+                arma_model = ARIMA(z, order=(p, 0, q)).fit()
                 fitted_models[f'{key}_ARMA'] = arma_model
-                print(f'  ✓ ARMA({p},{q}) converged – BIC={arma_model.bic:.1f}')
             except Exception as e:
-                print(f'  ✗ ARMA({p},{q}) failed: {e}')
-        else:
-            print(f'  → No MA component (q=0), using AR({p}) only.')
+                print(f'ARMA({p},{q}) failed for {key}: {e}')
 
     return fitted_models
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. EVALUATION
@@ -321,6 +286,7 @@ def evaluate_all_models(z_series, fitted_models, max_lag=24):
         variable, station = key.split('_', 1)
         z_clean = z.dropna()
         n    = len(z_clean)
+        max_lag_eff = min(max_lag, n // 2 - 1)  # ← diese Zeile muss vorhanden sein
         conf = 1.96 / np.sqrt(n)
         emp_acf = acf(z_clean, nlags=max_lag, fft=False, missing='drop')
         lags    = np.arange(1, max_lag + 1)
@@ -345,7 +311,7 @@ def evaluate_all_models(z_series, fitted_models, max_lag=24):
         ax.hlines([conf, -conf], 1, max_lag, colors='gray',
                   linestyles='dashed', label='95% CI')
         ax.axhspan(-conf, conf, alpha=0.08, color='gray')
-        ax.set_xlim(0, max_lag)  
+        ax.set_xlim(0, max_lag)
         ax.set_title(f'{station} {variable} – Empirical vs Theoretical ACFs '
                      f'(log-transformed + seasonally standardised)')
         ax.set_xlabel('Lag'); ax.set_ylabel('ACF')
@@ -356,22 +322,30 @@ def evaluate_all_models(z_series, fitted_models, max_lag=24):
         for model_type, model_obj in [('AR', ar_model), ('ARMA', arma_model)]:
             if model_obj is None:
                 continue
-            residuals = model_obj.resid
-            res_acf   = acf(residuals, nlags=max_lag, fft=False, missing='drop')
+            residuals = model_obj.resid.dropna()
+            n_res = len(residuals)
+            max_lag_res = min(max_lag_eff, n_res // 2 - 1)
+
+            if max_lag_res < 1:
+                print(f'  {model_type}: too few residuals (n={n_res}), skipping.')
+                continue
+
+            res_acf  = acf(residuals, nlags=max_lag_res, fft=False, missing='drop')
+            lags_res = np.arange(1, max_lag_res + 1)
 
             fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-            axes[0].stem(lags, res_acf[1:], linefmt='g-', markerfmt='go', basefmt=' ')
-            axes[0].hlines([conf, -conf], 1, max_lag, colors='gray',
+            axes[0].stem(lags_res, res_acf[1:], linefmt='g-', markerfmt='go', basefmt=' ')
+            axes[0].hlines([conf, -conf], 1, max_lag_res, colors='gray',
                            linestyles='dashed', label='95% CI')
             axes[0].axhspan(-conf, conf, alpha=0.08, color='gray')
-            ax.set_xlim(0, max_lag)  
+            axes[0].set_xlim(0, max_lag_res)
             axes[0].set_title(f'{station} {variable} – {model_type} Residual ACF')
             axes[0].set_xlabel('Lag'); axes[0].set_ylabel('ACF'); axes[0].legend()
             probplot(residuals, dist='norm', plot=axes[1])
             axes[1].set_title(f'{station} {variable} – {model_type} Probability Plot')
             plt.tight_layout(); plt.show()
 
-            sig = [lag for lag in range(1, max_lag + 1) if abs(res_acf[lag]) > conf]
+            sig = [lag for lag in range(1, max_lag_res + 1) if abs(res_acf[lag]) > conf]
             print(f'  {model_type} residual ACF significant at lags: '
                   f'{sig if sig else "none ✓"}')
 
