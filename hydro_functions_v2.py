@@ -251,8 +251,12 @@ def candidate_models(y, max_ar=6, max_ma=1):
 
 def fit_best_models(z_series, max_ar=6, max_ma=3):
     """
-    For each series in z_series, fit the best AR and best ARMA model.
-    Models are ranked by BIC — lower is better.
+    For each series in z_series, fit AR and ARMA models.
+    Model orders are selected based on PACF/ACF cutoffs (not BIC).
+    
+    - AR order p is determined from PACF (first non-significant lag).
+    - MA order q is determined from ACF (first non-significant lag).
+    
     Returns fitted_models dict: {key_AR: model, key_ARMA: model, ...}
     """
     fitted_models = {}
@@ -261,27 +265,28 @@ def fit_best_models(z_series, max_ar=6, max_ma=3):
         variable, station = key.split('_', 1)
         print(f'\n===== {station} {variable} =====')
 
-        # Fit all candidate models and rank by BIC
-        sel = candidate_models(z, max_ar=max_ar, max_ma=max_ma)
-        if sel.empty:
-            print('  No model converged – skipping.')
-            continue
-        display(sel.head(12))
+        # Determine AR and MA orders from PACF/ACF cutoffs
+        p, q = select_order_from_acf_pacf(z, max_lag=24, max_order=max_ar)
+        print(f'  PACF/ACF-based orders: p={p}, q={q}')
 
-        # Best AR (q=0)
-        best_ar = sel[sel['q'] == 0].iloc[0]
-        ar_p = int(best_ar['p'])
-        fitted_models[f'{key}_AR'] = ARIMA(z.dropna(), order=(ar_p, 0, 0)).fit()
-        print(f'  → Best AR:   AR({ar_p})  BIC={best_ar["bic"]:.1f}')
+        # Fit AR(p) model
+        try:
+            ar_model = ARIMA(z.dropna(), order=(p, 0, 0)).fit()
+            fitted_models[f'{key}_AR'] = ar_model
+            print(f'  ✓ AR({p})  converged – BIC={ar_model.bic:.1f}')
+        except Exception as e:
+            print(f'  ✗ AR({p}) failed: {e}')
 
-        # Best ARMA (q>0)
-        arma_candidates = sel[sel['q'] > 0]
-        if not arma_candidates.empty:
-            best_arma = arma_candidates.iloc[0]
-            arma_p = int(best_arma['p'])
-            arma_q = int(best_arma['q'])
-            fitted_models[f'{key}_ARMA'] = ARIMA(z.dropna(), order=(arma_p, 0, arma_q)).fit()
-            print(f'  → Best ARMA: ARMA({arma_p},{arma_q})  BIC={best_arma["bic"]:.1f}')
+        # Fit ARMA(p,q) model if q > 0
+        if q > 0:
+            try:
+                arma_model = ARIMA(z.dropna(), order=(p, 0, q)).fit()
+                fitted_models[f'{key}_ARMA'] = arma_model
+                print(f'  ✓ ARMA({p},{q}) converged – BIC={arma_model.bic:.1f}')
+            except Exception as e:
+                print(f'  ✗ ARMA({p},{q}) failed: {e}')
+        else:
+            print(f'  → No MA component (q=0), using AR({p}) only.')
 
     return fitted_models
 
